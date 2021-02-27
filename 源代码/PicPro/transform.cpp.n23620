@@ -1,0 +1,287 @@
+#include "transform.h"
+#include "ui_transform.h"
+
+TransForm::TransForm(QWidget *parent) :
+    QWidget(parent),
+    ui(new Ui::TransForm)
+{
+    ui->setupUi(this);
+    setAttribute(Qt::WA_QuitOnClose,false); //设置父窗口关闭后同时退出
+}
+
+TransForm::~TransForm()
+{
+    delete ui;
+}
+
+void TransForm::showImage(QLabel* ql,Mat simage,bool scaled) //在指定组件上展示图片
+{
+    int channel=simage.channels();
+    QImage img;
+    if(channel==3)
+    {
+        for(int i=0;i<simage.rows;i++) //qimage为RGB,需要交换一下顺序
+        {
+            for(int j=0;j<simage.cols;j++)
+            {
+                uchar b=simage.at<Vec3b>(i,j)[0];
+                uchar r=simage.at<Vec3b>(i,j)[2];
+                simage.at<Vec3b>(i,j)[0]=r;
+                simage.at<Vec3b>(i,j)[2]=b;
+            }
+        }
+        img = QImage((const unsigned char*)(simage.data),simage.cols,simage.rows,simage.cols*simage.channels(),QImage::Format_RGB888);
+    }
+    else if(channel==4) img = QImage((const unsigned char*)(simage.data),simage.cols, simage.rows ,simage.cols*simage.channels(), QImage::Format_ARGB32);
+    else img = QImage((const unsigned char*)(simage.data),simage.cols, simage.rows , simage.cols*simage.channels(),QImage::Format_Indexed8);
+    //第四个参数防止图片数据没有按照4字节对齐导致显示扭曲
+    if(scaled) img=img.scaled(ql->size(),Qt::IgnoreAspectRatio,Qt::SmoothTransformation); //是否适应窗口长度
+    ql->setPixmap(QPixmap::fromImage(img));
+    return;
+}
+
+
+void TransForm::on_Apic_clicked()
+{
+    ApicFileName = QFileDialog::getOpenFileName(this,"选择图片",".","Images (*.png *.bmp *.jpg *.tif *.GIF )");
+    if(ApicFileName.isEmpty())
+    {
+        return;
+    }
+    Aimage=imread(std::string((const char *)ApicFileName.toLocal8Bit())); //这样才可以读取中文路径
+    showImage(ui->showPic1,Aimage,true);
+    return;
+}
+
+void TransForm::on_Bpic_clicked()
+{
+    BpicFileName = QFileDialog::getOpenFileName(this,"选择图片",".","Images (*.png *.bmp *.jpg *.tif *.GIF )");
+    if(BpicFileName.isEmpty())
+    {
+        return;
+    }
+    Bimage=imread(std::string((const char *)BpicFileName.toLocal8Bit()));
+    showImage(ui->showPic2,Bimage,true);
+    return;
+}
+
+
+//检测68个面部标志
+void TransForm::faceLandmarkDetection(dlib::array2d<unsigned char>& img, shape_predictor sp, std::vector<Point2f>& landmark)
+{
+    dlib::frontal_face_detector detector = get_frontal_face_detector();
+    std::vector<dlib::rectangle> dets = detector(img);
+    full_object_detection shape = sp(img, dets[0]);
+
+    for (int i = 0; i < shape.num_parts(); ++i)
+    {
+        float x=shape.part(i).x();
+        float y=shape.part(i).y();
+        landmark.push_back(Point2f(x,y));
+    }
+}
+
+//添加八个关键点
+void TransForm::addKeypoints(std::vector<Point2f>& points,Size imgSize)
+{
+    points.push_back(Point2f(1,1));
+    points.push_back(Point2f(1,imgSize.height-1));
+    points.push_back(Point2f(imgSize.width-1,imgSize.height-1));
+    points.push_back(Point2f(imgSize.width-1,1));
+    points.push_back(Point2f(1,imgSize.height/2));
+    points.push_back(Point2f(imgSize.width/2,imgSize.height-1));
+    points.push_back(Point2f(imgSize.width-1,imgSize.height/2));
+    points.push_back(Point2f(imgSize.width/2,1));
+}
+
+//计算变换图上的关键点
+void TransForm::morpKeypoints(const std::vector<Point2f>& points1,const std::vector<Point2f>& points2,std::vector<Point2f>& pointsMorph, double alpha)
+{
+    for (int i = 0; i < points1.size(); i++)
+        {
+            float x, y;
+            x = (1 - alpha) * points1[i].x + alpha * points2[i].x;
+            y = (1 - alpha) * points1[i].y + alpha * points2[i].y;
+            pointsMorph.push_back(Point2f(x, y));
+        }
+}
+
+//三角剖分
+void TransForm::delaunayTriangulation(const std::vector<Point2f>& points1,const std::vector<Point2f>& points2,
+               std::vector<Point2f>& pointsMorph,double alpha,std::vector<correspondens>& delaunayTri,Size imgSize)
+{
+    morpKeypoints(points1,points2,pointsMorph,alpha);
+    Rect rect(0, 0, imgSize.width, imgSize.height);
+
+    for(int i=0;i<pointsMorph.size();++i)
+    {
+        //cout<<pointsMorph[i].x<<" "<<pointsMorph[i].y<<endl;
+    }
+    cv::Subdiv2D subdiv(rect);
+    for (std::vector<Point2f>::iterator it = pointsMorph.begin(); it != pointsMorph.end(); it++)
+        subdiv.insert(*it);
+    std::vector<Vec6f> triangleList;
+    subdiv.getTriangleList(triangleList);
+    for (size_t i = 0; i < triangleList.size(); ++i)
+    {
+
+        std::vector<Point2f> pt;
+        correspondens ind;
+        Vec6f t = triangleList[i];
+        pt.push_back( Point2f(t[0], t[1]) );
+        pt.push_back( Point2f(t[2], t[3]) );
+        pt.push_back( Point2f(t[4], t[5]) );
+
+        if (rect.contains(pt[0]) && rect.contains(pt[1]) && rect.contains(pt[2]))
+        {
+            int count = 0;
+            for (int j = 0; j < 3; ++j)
+                for (size_t k = 0; k < pointsMorph.size(); k++)
+                    if (abs(pt[j].x - pointsMorph[k].x) < 1.0   &&  abs(pt[j].y - pointsMorph[k].y) < 1.0)
+                    {
+                        ind.index.push_back(k);
+                        count++;
+                    }
+            if (count == 3)
+                delaunayTri.push_back(ind);
+        }
+    }
+
+}
+
+//仿射
+void TransForm::applyAffineTransform(Mat &warpImage, Mat &src, std::vector<Point2f> & srcTri, std::vector<Point2f> & dstTri)
+{
+    Mat warpMat = getAffineTransform(srcTri, dstTri);
+    warpAffine(src, warpImage, warpMat, warpImage.size(), cv::INTER_LINEAR, BORDER_REFLECT_101);
+}
+
+//核心代码
+void TransForm::morphTriangle(Mat &img1, Mat &img2, Mat &img, std::vector<Point2f> &t1, std::vector<Point2f> &t2, std::vector<Point2f> &t, double alpha)
+{
+    Rect r = cv::boundingRect(t);
+    Rect r1 = cv::boundingRect(t1);
+    Rect r2 = cv::boundingRect(t2);
+
+    std::vector<Point2f> t1Rect, t2Rect, tRect;
+    std::vector<Point> tRectInt;
+    for (int i = 0; i < 3; ++i)
+    {
+        tRect.push_back(Point2f(t[i].x - r.x, t[i].y - r.y));
+        tRectInt.push_back(Point(t[i].x - r.x, t[i].y - r.y));
+
+        t1Rect.push_back(Point2f(t1[i].x - r1.x, t1[i].y - r1.y));
+        t2Rect.push_back(Point2f(t2[i].x - r2.x, t2[i].y - r2.y));
+    }
+
+    Mat mask = Mat::zeros(r.height, r.width, CV_32FC3);
+    fillConvexPoly(mask, tRectInt, Scalar(1.0, 1.0, 1.0), 16, 0);
+
+    Mat img1Rect, img2Rect;
+    img1(r1).copyTo(img1Rect);
+    img2(r2).copyTo(img2Rect);
+
+    Mat warpImage1 = Mat::zeros(r.height, r.width, img1Rect.type());
+    Mat warpImage2 = Mat::zeros(r.height, r.width, img2Rect.type());
+
+    applyAffineTransform(warpImage1, img1Rect, t1Rect, tRect);
+    applyAffineTransform(warpImage2, img2Rect, t2Rect, tRect);
+
+    Mat imgRect = (1.0 - alpha)*warpImage1 + alpha*warpImage2;
+
+    multiply(imgRect, mask, imgRect);
+    multiply(img(r), Scalar(1.0, 1.0, 1.0) - mask, img(r));
+    img(r) = img(r) + imgRect;
+}
+
+//图像变换
+void TransForm::morp(Mat &img1, Mat &img2, Mat& imgMorph, double alpha, const std::vector<Point2f> &points1, const std::vector<Point2f> &points2, const std::vector<correspondens> &triangle)
+{
+    img1.convertTo(img1, CV_32F);
+    img2.convertTo(img2, CV_32F);
+
+    std::vector<Point2f> points;
+    morpKeypoints(points1,points2,points,alpha);
+
+
+    int x, y, z;
+    int count = 0;
+    for (int i=0;i<triangle.size();++i)
+    {
+        correspondens corpd=triangle[i];
+        x = corpd.index[0];
+        y = corpd.index[1];
+        z = corpd.index[2];
+        std::vector<Point2f> t1, t2, t;
+        t1.push_back(points1[x]);
+        t1.push_back(points1[y]);
+        t1.push_back(points1[z]);
+
+        t2.push_back(points2[x]);
+        t2.push_back(points2[y]);
+        t2.push_back(points2[z]);
+
+        t.push_back(points[x]);
+        t.push_back(points[y]);
+        t.push_back(points[z]);
+        morphTriangle(img1, img2, imgMorph, t1, t2, t, alpha);
+    }
+
+}
+
+void TransForm::on_show_clicked()  //展示图片变换过程
+{
+    if(!Aimage.data || !Bimage.data)
+    {
+        QMessageBox::warning(this,"提示","没有打开两张图片");
+        return;
+    }
+    shape_predictor sp;
+    deserialize("G:\\Qt\\project\\PicPro\\shape_predictor_68_face_landmarks.dat") >> sp;
+    dlib::array2d<unsigned char> imga,imgb;
+    dlib::load_image(imga, std::string((const char *)ApicFileName.toLocal8Bit()));
+    dlib::load_image(imgb, std::string((const char *)BpicFileName.toLocal8Bit()));
+    //检测面部标志
+    std::vector<Point2f> landmarksa,landmarksb;
+    faceLandmarkDetection(imga,sp,landmarksa);
+    faceLandmarkDetection(imgb,sp,landmarksb);
+    addKeypoints(landmarksa,Aimage.size());
+    addKeypoints(landmarksb,Bimage.size());
+    //面部变换
+    std::vector<Mat> results; //储存变换过程
+    results.push_back(Aimage);
+    imshow("Aimage",results[0]);
+    waitKey(0);
+    for(double alpha= 0.1;alpha<1; alpha += 0.1)
+    {
+        Mat imgMorph = Mat::zeros(Aimage.size(),CV_32FC3);
+        std::vector<Point2f> pointsMorph;
+        std::vector<correspondens> delaunayTri;
+        delaunayTriangulation(landmarksa,landmarksb,pointsMorph,alpha,delaunayTri,Aimage.size());
+        //qDebug()<<"done "<<alpha <<" delaunayTriangulation   "<<delaunayTri.size()<<endl;
+        morp(Aimage, Bimage, imgMorph, alpha, landmarksa, landmarksb, delaunayTri);
+        //qDebug()<<"done "<<alpha<<" morph"<<endl;
+        results.push_back(imgMorph);
+        imshow("",imgMorph);
+        waitKey(0);
+    }
+    results.push_back(Bimage);
+    imshow("",results[11]);
+    qDebug()<<results.size()<<endl;
+//    Mat result = Mat(Bimage.rows,Bimage.cols*results.size(),CV_32FC3);
+//    for(size_t i=0;i<results.size();i++)
+//    {
+//        int offset = i*Bimage.cols;
+//        for(int j=0;j<Bimage.rows;j++)
+//        {
+//            for(int k=offset;k<offset+Bimage.cols;k++)
+//            {
+//                 result.at<Vec3f>(j,k)=results[0].at<Vec3f>(j,k-offset);
+//            }
+//        }
+//    }
+//    namedWindow("变换过程",WINDOW_AUTOSIZE);
+//    imshow("变换过程",result);
+//    waitKey(0);
+    return;
+}
